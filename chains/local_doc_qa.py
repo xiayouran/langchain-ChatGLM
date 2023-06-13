@@ -3,7 +3,7 @@ from langchain.vectorstores import FAISS
 from langchain.document_loaders import UnstructuredFileLoader, TextLoader
 from configs.model_config import *
 import datetime
-from textsplitter import ChineseTextSplitter
+from textsplitter import ChineseTextSplitter, ChineseTextSplitterOnlyTxt
 from typing import List, Tuple, Dict
 from langchain.docstore.document import Document
 import numpy as np
@@ -19,6 +19,9 @@ import models.shared as shared
 from agent import bing_search
 from langchain.docstore.document import Document
 from functools import lru_cache
+
+from datasets import load_metric
+import jieba
 
 
 # patch HuggingFaceEmbeddings to make it hashable
@@ -64,7 +67,8 @@ def load_file(filepath, sentence_size=SENTENCE_SIZE):
         docs = loader.load()
     elif filepath.lower().endswith(".txt"):
         loader = TextLoader(filepath, autodetect_encoding=True)
-        textsplitter = ChineseTextSplitter(pdf=False, sentence_size=sentence_size)
+        # textsplitter = ChineseTextSplitter(pdf=False, sentence_size=sentence_size)
+        textsplitter = ChineseTextSplitterOnlyTxt(sentence_size=sentence_size)
         docs = loader.load_and_split(textsplitter)
     elif filepath.lower().endswith(".pdf"):
         loader = UnstructuredPaddlePDFLoader(filepath)
@@ -174,6 +178,41 @@ def similarity_search_with_score_by_vector(
         docs.append(doc)
     torch_gc()
     return docs
+
+
+def similarity_search_with_score_by_vector_no_add(
+        self, embedding: List[float], k: int = 4
+) -> List[Tuple[Document, float]]:
+    scores, indices = self.index.search(np.array([embedding], dtype=np.float32), k)
+    docs = []
+    for j, i in enumerate(indices[0]):
+        if i == -1:
+            # This happens when not enough docs are returned.
+            continue
+        _id = self.index_to_docstore_id[i]
+        doc = self.docstore.search(_id)
+        if not isinstance(doc, Document):
+            raise ValueError(f"Could not find document for id {_id}, got {doc}")
+        doc.metadata["score"] = scores[0, j]
+        docs.append(doc)
+
+    return docs
+
+
+bleu = load_metric("sacrebleu")
+
+
+def filter_search_by_sarcebleu(search_list, query):
+    pred = jieba.lcut(query)
+    refer_list = [jieba.lcut(text.page_content) for text in search_list]
+
+    for i, refer in enumerate(refer_list):
+        bleu_score = bleu.compute(predictions=[pred], references=[[refer]])
+        search_list[i].metadata['bleu_score'] = bleu_score['score']
+
+    search_list = sorted(search_list, key=lambda item: item.metadata['bleu_score'], reverse=True)
+
+    return search_list[:3]
 
 
 def search_result2docs(search_results):
@@ -292,12 +331,15 @@ class LocalDocQA:
 
     def get_knowledge_based_answer(self, query, vs_path, chat_history=[], streaming: bool = STREAMING):
         vector_store = load_vector_store(vs_path, self.embeddings)
-        FAISS.similarity_search_with_score_by_vector = similarity_search_with_score_by_vector
+        FAISS.similarity_search_with_score_by_vector = similarity_search_with_score_by_vector_no_add
         vector_store.chunk_size = self.chunk_size
         vector_store.chunk_conent = self.chunk_conent
         vector_store.score_threshold = self.score_threshold
         related_docs_with_score = vector_store.similarity_search_with_score(query, k=self.top_k)
         torch_gc()
+
+        related_docs_with_score = filter_search_by_sarcebleu(related_docs_with_score, query)
+
         prompt = generate_prompt(related_docs_with_score, query)
 
         for answer_result in self.llm.generatorAnswer(prompt=prompt, history=chat_history,
@@ -308,6 +350,69 @@ class LocalDocQA:
             response = {"query": query,
                         "result": resp,
                         "source_documents": related_docs_with_score}
+            yield response, history
+
+    def get_question_based_answer_start(self, chat_history=[], streaming: bool = STREAMING):
+        prompt = """需要你完成根据文本内容进行问题抽取的任务，当我给你一段文本内容时，你需要从这段内容中提取出多个问题和对应问题的答案，使这些问题的答案都出自这段文本内容。提取出的问题要符合人们提问问题的方式。"""
+
+        for answer_result in self.llm.generatorAnswer(prompt=prompt, history=chat_history,
+                                                      streaming=streaming):
+            resp = answer_result.llm_output["answer"]
+            history = answer_result.history
+            history[-1][0] = prompt
+            response = {"prompt": prompt,
+                        "result": resp}
+
+            yield response, history
+
+    def get_question_based_answer(self, context, vs_path, chat_history=[], streaming: bool = STREAMING):
+        vector_store = load_vector_store(vs_path, self.embeddings)
+        FAISS.similarity_search_with_score_by_vector = similarity_search_with_score_by_vector_no_add
+        vector_store.chunk_size = self.chunk_size
+        vector_store.chunk_conent = self.chunk_conent
+        vector_store.score_threshold = self.score_threshold
+        torch_gc()
+
+        # prompt_template = """文本内容是：{context}
+        # 文本内容是由多个问题的答案组成，问题的主语是这段文本内容第一个“的”字前面的内容，需要你从这段文字中提取所有与该主语相关的问题，并给出问题的答案，答案也要来自于这段文本内容。比如问题的主语是“加盖校级印章”，那么相应的问题可以是“加盖校级印章的责任单位是谁？”，答案是“党政办公室”"""
+        # prompt_template = """给你一段文本内容，该文本内容是由多个问题的答案组成，问题的主语是这段文本内容第一个“的”字前面的内容，需要你从这段文字中提取所有与该主语相关的问题，并给出问题的答案，答案也要来自于这段文本内容。比如问题的主语是“加盖校级印章”，那么相应的问题可以是“加盖校级印章的责任单位是谁？”，答案是“党政办公室”。文本内容是：{context}"""
+        # prompt_template = """你需要完成一个由文本内容生成内容相关问题的任务，当我给你一段文本时，你需要根据对这段文本内容的理解，提出10个与这段内容相关的问题。文本内容是：{context}"""
+        # prompt_template = """你需要完成一个由文本内容生成内容相关问题与问题答案的任务，当我给你一段文本时，你需要根据对这段文本内容的理解，提出10个与这段内容相关的问题，并从这段文本中找出对应的答案，如果找不到答案，直接回复：无。文本内容是：{context}"""
+        # prompt_template = """你需要完成一个由文本内容生成内容相关问题与问题答案的任务，当我给你一段文本时，你需要根据对这段文本内容的理解，提出5个与这段内容相关的问题，并从这段文本中找出对应的答案，如果找不到答案，直接回复：无。每个问题与答案以json的形式输出。文本内容是：{context}"""
+        prompt_template = """你需要完成一个由文本内容生成与该文本内容相关的问题的任务，当我给你一段文本时，你需要根据对这段文本内容的理解，提出10个与这段内容相关的问题(只需要给出问题不用给出答案)，每个问题以json的形式输出，语言为中文。给你的文本内容是：{context}"""
+
+        prompt = prompt_template.replace("{context}", context)
+
+        for answer_result in self.llm.generatorAnswer(prompt=prompt, history=chat_history,
+                                                      streaming=streaming):
+            resp = answer_result.llm_output["answer"]
+            history = answer_result.history
+            history[-1][0] = context
+            response = {"context": context,
+                        "result": resp}
+
+            yield response, history
+
+    def get_question_based_answer_again(self, context, vs_path, chat_history=[], streaming: bool = STREAMING):
+        vector_store = load_vector_store(vs_path, self.embeddings)
+        FAISS.similarity_search_with_score_by_vector = similarity_search_with_score_by_vector_no_add
+        vector_store.chunk_size = self.chunk_size
+        vector_store.chunk_conent = self.chunk_conent
+        vector_store.score_threshold = self.score_threshold
+        torch_gc()
+
+        # prompt_template = """假设你是一位老师，需要跟学生出一些考试题目。根据已知的内容：{context} 你可以给学生出哪些问题？并在问题的后面给出相应的答案。问题的主语或中心主旨是加盖校级印章，要求是给出的问题符合人们的日常提问问题的方式，问题的答案必须在给定的内容中，不能超出给定内容的范围，答案请使用中文。"""
+        prompt_template = """根据已知的内容：{context}提出相应的问题，并在问题的后面给出相应的答案。问题的主语或中心主旨是加盖校级印章，要求是给出的问题符合人们的日常提问问题的方式，答案请使用中文。"""
+        prompt = prompt_template.replace("{context}", context)
+
+        for answer_result in self.llm.generatorAnswer(prompt=prompt, history=chat_history,
+                                                      streaming=streaming):
+            resp = answer_result.llm_output["answer"]
+            history = answer_result.history
+            history[-1][0] = context
+            response = {"context": context,
+                        "result": resp}
+
             yield response, history
 
     # query      查询内容

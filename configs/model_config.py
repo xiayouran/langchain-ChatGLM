@@ -12,8 +12,8 @@ logging.basicConfig(format=LOG_FORMAT)
 embedding_model_dict = {
     "ernie-tiny": "nghuyong/ernie-3.0-nano-zh",
     "ernie-base": "nghuyong/ernie-3.0-base-zh",
-    "text2vec-base": "shibing624/text2vec-base-chinese",
-    "text2vec": "GanymedeNil/text2vec-large-chinese",
+    "text2vec-base": "/root/data1/liyanpeng/models/text2vec-base-chinese",
+    "text2vec": "/root/data1/liyanpeng/models/text2vec-large-chinese",
 }
 
 # Embedding model name
@@ -46,7 +46,7 @@ llm_model_dict = {
     },
     "chatglm-6b": {
         "name": "chatglm-6b",
-        "pretrained_model_name": "THUDM/chatglm-6b",
+        "pretrained_model_name": "/root/data1/liyanpeng/models/chatglm-6b",
         "local_model_path": None,
         "provides": "ChatGLM"
     },
